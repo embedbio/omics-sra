@@ -10,10 +10,12 @@ Parameters:
   FunctionName:
     Type: String
     Default: omics-sra-wgs-batches
-  OutputPrefix:
+  OutputRoot:
     Type: String
-    Default: wgs_runs/taxon_id=9685
-    Description: Key prefix in the bucket for batches and seen_runs.parquet
+    Default: wgs_runs
+    Description: >-
+      Key prefix in the bucket. Each organism in config.yaml gets its own folder
+      under it (<OutputRoot>/taxon_id=<id>/) for its batches and seen_runs.parquet.
   ScheduleExpression:
     Type: String
     Default: cron(0 13 ? * MON *)
@@ -113,7 +115,7 @@ Resources:
                 Action:
                   - s3:GetObject
                   - s3:PutObject
-                Resource: !Sub ${Bucket.Arn}/${OutputPrefix}/*
+                Resource: !Sub ${Bucket.Arn}/${OutputRoot}/*
               - Effect: Allow
                 # Needed so HeadObject on a missing key returns 404 rather than 403.
                 Action: s3:ListBucket
@@ -126,7 +128,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Ref FunctionName
-      Description: Weekly batch of new SRA WGS runs from OmicIDX
+      Description: Weekly batch of new SRA WGS runs from OmicIDX, per organism
       PackageType: Image
       Code:
         ImageUri: !Ref ImageUri
@@ -140,7 +142,7 @@ Resources:
         LogGroup: !Ref LogGroup
       Environment:
         Variables:
-          OUTPUT_URI: !Sub s3://${Bucket}/${OutputPrefix}/
+          OUTPUT_ROOT: !Sub s3://${Bucket}/${OutputRoot}/
           NOTIFY_TOPIC_ARN: !Ref BatchTopic
 
   FunctionAsyncConfig:
@@ -234,8 +236,9 @@ Resources:
 Outputs:
   BucketName:
     Value: !Ref Bucket
-  OutputUri:
-    Value: !Sub s3://${Bucket}/${OutputPrefix}/
+  OutputRoot:
+    Description: Each organism's batches are under <this>/taxon_id=<id>/
+    Value: !Sub s3://${Bucket}/${OutputRoot}/
   FunctionName:
     Value: !Ref Function
   ScheduleName:

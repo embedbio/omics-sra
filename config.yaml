@@ -1,12 +1,10 @@
 # Parameters for wgs_runs.py. Any value here can be overridden on the command line.
+#
+# The top-level keys are defaults shared by every organism. The ORGANISMS section at
+# the bottom lists the organisms to query; each entry needs TAXON_ID and GENOME_SIZE
+# and can override any default (MIN_COVERAGE, LIBRARY_SOURCE, PLATFORM, RELEASE).
 
-# NCBI taxonomy ID of the organism (9685 = Felis catus)
-TAXON_ID: 9685
-
-# Approximate genome size in bases, used to estimate coverage (total_bases / GENOME_SIZE)
-GENOME_SIZE: 2.7e9
-
-# Keep only runs with at least this estimated coverage
+# Keep only runs with at least this estimated coverage (total_bases / GENOME_SIZE)
 MIN_COVERAGE: 1.0
 
 # OmicIDX release: "latest" or a pinned version such as "v2026-11-02"
@@ -23,7 +21,27 @@ LIBRARY_SOURCE: GENOMIC
 # Common values: ILLUMINA, PACBIO_SMRT, OXFORD_NANOPORE, BGISEQ, DNBSEQ, ION_TORRENT, LS454, ULTIMA, ELEMENT
 PLATFORM: ALL
 
-# Batch mode: a local directory or s3://bucket/prefix. Each run writes only runs
-# not output by an earlier batch. null = one-shot mode (print or -o).
-# On AWS the Lambda sets this from its OUTPUT_URI environment variable.
+# Batch mode: a local directory or s3://bucket/prefix. Each organism gets its own
+# folder under it, <OUTPUT_URI>/taxon_id=<TAXON_ID>/, and each run writes only runs
+# not output by an earlier batch for that organism. null = one-shot mode (print or -o).
+# On AWS the Lambda sets this from its OUTPUT_ROOT environment variable.
 OUTPUT_URI: null
+
+# Organisms to query. The name is used in logs, emails and --organism.
+#   TAXON_ID:    NCBI taxonomy ID (https://www.ncbi.nlm.nih.gov/taxonomy)
+#   GENOME_SIZE: approximate genome size in bases, used to estimate coverage
+# Adding an organism here adds it to the weekly AWS job; its first batch holds
+# every run that currently matches.
+ORGANISMS:
+  cat:
+    TAXON_ID: 9685      # Felis catus
+    GENOME_SIZE: 2.7e9
+  dog:
+    TAXON_ID: 9615      # Canis lupus familiaris
+    GENOME_SIZE: 2.4e9
+  # Example with per-organism overrides:
+  # cattle:
+  #   TAXON_ID: 9913    # Bos taurus
+  #   GENOME_SIZE: 2.7e9
+  #   MIN_COVERAGE: 5
+  #   PLATFORM: ILLUMINA

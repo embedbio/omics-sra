@@ -208,34 +208,82 @@ def test_batches_on_s3(s3_store):
 # Lambda handler
 # ---------------------------------------------------------------------------
 
-def test_handler_params_from_env_and_event(monkeypatch, tmp_path):
-    monkeypatch.setenv("OUTPUT_URI", str(tmp_path / "env"))
-    p = lambda_handler.build_params({"MIN_COVERAGE": 10})
-    assert p.output_uri == str(tmp_path / "env")
-    assert p.min_coverage == 10.0
-    assert p.taxon_id == 9685  # from the bundled config.yaml
-    assert lambda_handler.build_params({"OUTPUT_URI": "s3://b/p"}).output_uri == "s3://b/p"
+def handler_batch(release_name, *run_ids):
+    """Stand-in for run_batch in the handler: same run IDs for every organism."""
+    return lambda params, store: run_batch(params, store, query=fake_query(*run_ids),
+                                           resolve=release(release_name),
+                                           now=lambda: datetime(2026, 11, 10, tzinfo=UTC))
 
 
-def test_handler_requires_output_uri(monkeypatch):
-    monkeypatch.delenv("OUTPUT_URI", raising=False)
-    with pytest.raises(ValueError, match="OUTPUT_URI"):
+def test_handler_params_one_per_organism(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTPUT_ROOT", str(tmp_path / "root"))
+    ps = lambda_handler.build_params({"MIN_COVERAGE": 10})
+    by_name = {p.organism: p for p in ps}
+    assert set(by_name) == {"cat", "dog"}  # from the bundled config.yaml
+    assert by_name["cat"].taxon_id == 9685 and by_name["cat"].genome_size == 2.7e9
+    assert by_name["dog"].taxon_id == 9615 and by_name["dog"].genome_size == 2.4e9
+    assert all(p.min_coverage == 10.0 for p in ps)  # event overrides apply to every organism
+    assert by_name["cat"].output_uri == f"{tmp_path / 'root'}/taxon_id=9685/"
+    assert by_name["dog"].output_uri == f"{tmp_path / 'root'}/taxon_id=9615/"
+
+
+def test_handler_event_selects_organisms_and_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTPUT_ROOT", str(tmp_path / "root"))
+    [p] = lambda_handler.build_params({"ORGANISM": "dog", "OUTPUT_URI": "s3://b/_test"})
+    assert (p.organism, p.output_uri) == ("dog", "s3://b/_test/taxon_id=9615/")
+    assert len(lambda_handler.build_params({"ORGANISM": ["cat", "dog"]})) == 2
+    with pytest.raises(ValueError, match="unknown organism"):
+        lambda_handler.build_params({"ORGANISM": "dgo"})
+
+
+def test_handler_requires_output_root(monkeypatch):
+    monkeypatch.delenv("OUTPUT_ROOT", raising=False)
+    with pytest.raises(ValueError, match="OUTPUT_ROOT"):
+        lambda_handler.build_params({})
+
+
+def test_handler_ignores_old_output_uri_env(monkeypatch):
+    # The pre-multi-organism stack set OUTPUT_URI to cat's folder. Ignoring it means a
+    # stale stack fails loudly instead of nesting batches under taxon_id=9685/.
+    monkeypatch.delenv("OUTPUT_ROOT", raising=False)
+    monkeypatch.setenv("OUTPUT_URI", "s3://b/wgs_runs/taxon_id=9685/")
+    with pytest.raises(ValueError, match="OUTPUT_ROOT"):
         lambda_handler.build_params({})
 
 
 def test_handler_rejects_unknown_event_keys(monkeypatch, tmp_path):
-    monkeypatch.setenv("OUTPUT_URI", str(tmp_path))
+    monkeypatch.setenv("OUTPUT_ROOT", str(tmp_path))
     with pytest.raises(ValueError, match="unknown parameter"):
         lambda_handler.build_params({"MIN_COVRAGE": 1})
 
 
-def test_handler_runs_batch(monkeypatch, tmp_path):
-    monkeypatch.setenv("OUTPUT_URI", str(tmp_path / "out"))
-    monkeypatch.setattr(lambda_handler, "run_batch",
-                        lambda params, store: batch(store, "v2026-11-03", "SRR1", "SRR2"))
+def test_handler_writes_a_batch_per_organism(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTPUT_ROOT", str(tmp_path / "out"))
+    monkeypatch.delenv("NOTIFY_TOPIC_ARN", raising=False)
+    monkeypatch.setattr(lambda_handler, "run_batch", handler_batch("v2026-11-03", "SRR1", "SRR2"))
     result = lambda_handler.handler({}, None)
-    assert result["batch_id"] == "v2026-11-03" and result["new"] == 2
-    assert read_ids(LocalStore(tmp_path / "out"), "v2026-11-03") == ["SRR1", "SRR2"]
+    assert [(r["organism"], r["taxon_id"], r["new"]) for r in result["batches"]] == \
+        [("cat", 9685, 2), ("dog", 9615, 2)]
+    for taxon in (9685, 9615):
+        store = LocalStore(tmp_path / "out" / f"taxon_id={taxon}")
+        assert read_ids(store, "v2026-11-03") == ["SRR1", "SRR2"]
+        assert json.loads(store.read_bytes(batch_key("v2026-11-03", "manifest.json")))["parameters"]["TAXON_ID"] == taxon
+
+
+def test_handler_one_organism_failing_does_not_stop_the_others(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTPUT_ROOT", str(tmp_path / "out"))
+    monkeypatch.delenv("NOTIFY_TOPIC_ARN", raising=False)
+    ok = handler_batch("v2026-11-03", "SRR1")
+
+    def flaky(params, store):
+        if params.organism == "cat":
+            raise OSError("network down")
+        return ok(params, store)
+
+    monkeypatch.setattr(lambda_handler, "run_batch", flaky)
+    with pytest.raises(RuntimeError, match=r"1 of 2 organism\(s\) failed: cat \(taxon 9685\)"):
+        lambda_handler.handler({}, None)
+    assert read_ids(LocalStore(tmp_path / "out" / "taxon_id=9615"), "v2026-11-03") == ["SRR1"]
 
 
 # ---------------------------------------------------------------------------
@@ -310,31 +358,45 @@ def sns_topic(monkeypatch):
         yield topic, received
 
 
-def run_handler(monkeypatch, tmp_path, topic, release_name, *run_ids):
-    monkeypatch.setenv("OUTPUT_URI", str(tmp_path / "out"))
+def run_handler(monkeypatch, tmp_path, topic, release_name, *run_ids, event=None):
+    monkeypatch.setenv("OUTPUT_ROOT", str(tmp_path / "out"))
     if topic:
         monkeypatch.setenv("NOTIFY_TOPIC_ARN", topic)
     else:
         monkeypatch.delenv("NOTIFY_TOPIC_ARN", raising=False)
-    monkeypatch.setattr(lambda_handler, "run_batch",
-                        lambda params, store: batch(store, release_name, *run_ids))
-    return lambda_handler.handler({}, None)
+    monkeypatch.setattr(lambda_handler, "run_batch", handler_batch(release_name, *run_ids))
+    return lambda_handler.handler(event or {}, None)
 
 
-def test_handler_emails_new_batch(monkeypatch, tmp_path, sns_topic):
+def test_handler_emails_each_organism_separately(monkeypatch, tmp_path, sns_topic):
     topic, received = sns_topic
     run_handler(monkeypatch, tmp_path, topic, "v2026-11-03", "SRR1", "SRR2")
+    msgs = sorted(received(), key=lambda m: m["Subject"])
+    assert [m["Subject"] for m in msgs] == [
+        "omics-sra: 2 new cat (taxon 9685) WGS runs in batch v2026-11-03",
+        "omics-sra: 2 new dog (taxon 9615) WGS runs in batch v2026-11-03",
+    ]
+    cat, dog = msgs
+    assert "runs for cat (taxon 9685) was written" in cat["Message"] and "taxon_id=9685/batches" in cat["Message"]
+    assert "runs for dog (taxon 9615) was written" in dog["Message"] and "taxon_id=9615/batches" in dog["Message"]
+    assert "ORGANISM=" not in dog["Message"]
+    assert dog["MessageAttributes"]["taxon_id"] == {"Type": "Number", "Value": "9615"}
+    assert dog["MessageAttributes"]["organism"] == {"Type": "String", "Value": "dog"}
+
+
+def test_handler_emails_only_selected_organism(monkeypatch, tmp_path, sns_topic):
+    topic, received = sns_topic
+    run_handler(monkeypatch, tmp_path, topic, "v2026-11-03", "SRR1", event={"ORGANISM": "dog"})
     [msg] = received()
-    assert msg["Subject"] == "omics-sra: 2 new WGS runs in batch v2026-11-03"
-    assert "Runs: SRR1, SRR2" in msg["Message"]
+    assert msg["Subject"].startswith("omics-sra: 1 new dog (taxon 9615) WGS run ")
 
 
 def test_handler_does_not_email_skipped_batch(monkeypatch, tmp_path, sns_topic):
     topic, received = sns_topic
     run_handler(monkeypatch, tmp_path, topic, "v2026-11-03", "SRR1")
-    received()  # drain the first notice
+    assert len(received()) == 2  # drain the first notices
     result = run_handler(monkeypatch, tmp_path, topic, "v2026-11-03", "SRR1")
-    assert result["skipped"]
+    assert all(r["skipped"] for r in result["batches"])
     assert received() == []
 
 
@@ -345,13 +407,14 @@ def test_handler_without_topic_sends_nothing(monkeypatch, tmp_path):
     assert called == []
 
 
-def test_handler_notification_failure_raises_after_batch_is_saved(monkeypatch, tmp_path):
+def test_handler_notification_failure_raises_after_batches_are_saved(monkeypatch, tmp_path):
     def boom(*a, **k):
         raise RuntimeError("SNS down")
 
     monkeypatch.setattr(notify, "publish", boom)
-    with pytest.raises(RuntimeError, match="SNS down"):
+    with pytest.raises(RuntimeError, match="2 of 2 organism"):
         run_handler(monkeypatch, tmp_path, "arn:aws:sns:us-west-1:123:t", "v2026-11-03", "SRR1")
-    store = LocalStore(tmp_path / "out")
-    assert store.exists(batch_key("v2026-11-03", "manifest.json"))  # batch committed anyway
-    assert read_ids(store, "v2026-11-03") == ["SRR1"]
+    for taxon in (9685, 9615):  # both batches committed anyway
+        store = LocalStore(tmp_path / "out" / f"taxon_id={taxon}")
+        assert store.exists(batch_key("v2026-11-03", "manifest.json"))
+        assert read_ids(store, "v2026-11-03") == ["SRR1"]
