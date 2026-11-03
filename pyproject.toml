@@ -12,7 +12,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ipykernel>=7.4.0",
-    "moto[s3]>=5.2.5",
+    "moto[s3,sns]>=5.2.5",
     "pytest>=9.2.0",
 ]
 lambda = [

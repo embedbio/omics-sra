@@ -236,3 +236,122 @@ def test_handler_runs_batch(monkeypatch, tmp_path):
     result = lambda_handler.handler({}, None)
     assert result["batch_id"] == "v2026-11-03" and result["new"] == 2
     assert read_ids(LocalStore(tmp_path / "out"), "v2026-11-03") == ["SRR1", "SRR2"]
+
+
+# ---------------------------------------------------------------------------
+# Batch notification (notify.py)
+# ---------------------------------------------------------------------------
+
+import notify  # noqa: E402
+
+
+def test_notify_subject():
+    r = b.BatchResult("v2026-11-10", "2026-11-10", False, 10, 1, 9, "s3://b/p/")
+    assert notify.subject(r) == "omics-sra: 1 new WGS run in batch v2026-11-10"
+    r2 = b.BatchResult("v2026-11-10", "2026-11-10", False, 1600, 1234, 366, "s3://b/p/")
+    assert notify.subject(r2) == "omics-sra: 1,234 new WGS runs in batch v2026-11-10"
+    assert len(notify.subject(r2)) <= notify.SNS_SUBJECT_LIMIT
+
+
+def test_notify_message_lists_counts_studies_and_files(store):
+    batch(store, "v2026-11-03", "SRR1")
+    result = batch(store, "v2026-11-10", "SRR1", "SRR2", "SRR3")
+    msg = notify.message(result, store)
+    assert "release v2026-11-10 (published 2026-11-10)" in msg
+    assert "New runs in this batch:      2" in msg
+    assert "Already in earlier batches:  1" in msg
+    assert "Total runs output so far:    3" in msg
+    assert "TAXON_ID=9685" in msg and "LIBRARY_SOURCE=GENOMIC" in msg and "PLATFORM=ALL" in msg
+    assert "OUTPUT_URI" not in msg
+    assert "SRP0000001" in msg and "Cat genomes" in msg  # study from make_output_row
+    assert "Runs: SRR2, SRR3" in msg
+    assert "batches/v2026-11-10/run_ids.txt" in msg
+    assert "S3 console" not in msg and "aws s3 cp" not in msg  # local store
+
+
+def test_notify_message_empty_batch(store):
+    batch(store, "v2026-11-03", "SRR1")
+    msg = notify.message(batch(store, "v2026-11-10", "SRR1"), store)
+    assert "New runs in this batch:      0" in msg
+    assert "No new runs this time" in msg
+    assert "Runs:" not in msg
+
+
+def test_notify_message_truncates_long_run_list(store):
+    ids = [f"SRR{i}" for i in range(notify.MAX_RUN_IDS + 5)]
+    msg = notify.message(batch(store, "v2026-11-03", *ids), store)
+    assert "(+5 more)" in msg
+    assert f"SRR{notify.MAX_RUN_IDS + 4}" not in msg
+
+
+def test_notify_message_s3_console_link(s3_store):
+    msg = notify.message(batch(s3_store, "v2026-11-03", "SRR1"), s3_store)
+    assert ("S3 console: https://s3.console.aws.amazon.com/s3/buckets/test-bucket?region=us-west-1"
+            "&prefix=wgs_runs/taxon_id%3D9685/batches/v2026-11-03/") in msg
+    assert "aws s3 cp s3://test-bucket/wgs_runs/taxon_id=9685/batches/v2026-11-03/run_ids.txt ." in msg
+
+
+@pytest.fixture
+def sns_topic(monkeypatch):
+    """A moto SNS topic with an SQS queue subscribed, so published messages can be read back."""
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-west-1")
+    with mock_aws():
+        sns = boto3.client("sns", region_name="us-west-1")
+        sqs = boto3.client("sqs", region_name="us-west-1")
+        topic = sns.create_topic(Name="omics-sra-batches")["TopicArn"]
+        queue = sqs.create_queue(QueueName="q")["QueueUrl"]
+        queue_arn = sqs.get_queue_attributes(QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        sns.subscribe(TopicArn=topic, Protocol="sqs", Endpoint=queue_arn)
+
+        def received() -> list[dict]:
+            msgs = sqs.receive_message(QueueUrl=queue, MaxNumberOfMessages=10).get("Messages", [])
+            return [json.loads(m["Body"]) for m in msgs]
+
+        yield topic, received
+
+
+def run_handler(monkeypatch, tmp_path, topic, release_name, *run_ids):
+    monkeypatch.setenv("OUTPUT_URI", str(tmp_path / "out"))
+    if topic:
+        monkeypatch.setenv("NOTIFY_TOPIC_ARN", topic)
+    else:
+        monkeypatch.delenv("NOTIFY_TOPIC_ARN", raising=False)
+    monkeypatch.setattr(lambda_handler, "run_batch",
+                        lambda params, store: batch(store, release_name, *run_ids))
+    return lambda_handler.handler({}, None)
+
+
+def test_handler_emails_new_batch(monkeypatch, tmp_path, sns_topic):
+    topic, received = sns_topic
+    run_handler(monkeypatch, tmp_path, topic, "v2026-11-03", "SRR1", "SRR2")
+    [msg] = received()
+    assert msg["Subject"] == "omics-sra: 2 new WGS runs in batch v2026-11-03"
+    assert "Runs: SRR1, SRR2" in msg["Message"]
+
+
+def test_handler_does_not_email_skipped_batch(monkeypatch, tmp_path, sns_topic):
+    topic, received = sns_topic
+    run_handler(monkeypatch, tmp_path, topic, "v2026-11-03", "SRR1")
+    received()  # drain the first notice
+    result = run_handler(monkeypatch, tmp_path, topic, "v2026-11-03", "SRR1")
+    assert result["skipped"]
+    assert received() == []
+
+
+def test_handler_without_topic_sends_nothing(monkeypatch, tmp_path):
+    called = []
+    monkeypatch.setattr(notify, "publish", lambda *a, **k: called.append(a))
+    run_handler(monkeypatch, tmp_path, None, "v2026-11-03", "SRR1")
+    assert called == []
+
+
+def test_handler_notification_failure_raises_after_batch_is_saved(monkeypatch, tmp_path):
+    def boom(*a, **k):
+        raise RuntimeError("SNS down")
+
+    monkeypatch.setattr(notify, "publish", boom)
+    with pytest.raises(RuntimeError, match="SNS down"):
+        run_handler(monkeypatch, tmp_path, "arn:aws:sns:us-west-1:123:t", "v2026-11-03", "SRR1")
+    store = LocalStore(tmp_path / "out")
+    assert store.exists(batch_key("v2026-11-03", "manifest.json"))  # batch committed anyway
+    assert read_ids(store, "v2026-11-03") == ["SRR1"]

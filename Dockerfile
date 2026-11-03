@@ -19,7 +19,7 @@ RUN uv export --frozen --no-dev --group lambda --no-emit-project -o requirements
     && uv pip install --system --no-cache -r requirements.txt \
     && rm requirements.txt
 
-COPY wgs_runs.py batches.py lambda_handler.py config.yaml ./
+COPY wgs_runs.py batches.py notify.py lambda_handler.py config.yaml ./
 
 ENTRYPOINT ["python", "-m", "awslambdaric"]
 CMD ["lambda_handler.handler"]
