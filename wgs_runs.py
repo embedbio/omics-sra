@@ -1,11 +1,13 @@
-"""Find SRA whole genome sequencing (WGS) runs for one organism in OmicIDX.
+"""Find SRA whole genome sequencing (WGS) runs for one or more organisms in OmicIDX.
 
 Parameters come from a YAML config file (default: config.yaml next to this script).
-Command-line flags override values from the file.
+Its ORGANISMS section lists the organisms to query; top-level keys are defaults
+shared by all of them. Command-line flags override values from the file.
 
 Examples:
-    uv run wgs_runs.py
-    uv run wgs_runs.py --taxon-id 9615 --genome-size 2.4e9 --min-coverage 5
+    uv run wgs_runs.py                          # every organism in config.yaml
+    uv run wgs_runs.py --organism dog --min-coverage 5
+    uv run wgs_runs.py --taxon-id 9913 --genome-size 2.7e9   # one-off organism not in the config
     uv run wgs_runs.py --config other.yaml --output runs.tsv
 """
 
@@ -14,6 +16,7 @@ import dataclasses
 import json
 import sys
 import urllib.request
+from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import Self
@@ -112,6 +115,7 @@ class Params:
     library_source: tuple[str, ...] | None = ("GENOMIC",)
     platform: tuple[str, ...] | None = None
     output_uri: str | None = None  # batch mode: local directory or s3://bucket/prefix
+    organism: str | None = None    # name from the ORGANISMS section, used in logs and emails
 
     def __post_init__(self) -> None:
         # Coerce types: PyYAML reads 2.7e9 as a string, not a float.
@@ -123,6 +127,8 @@ class Params:
         object.__setattr__(self, "platform", _filter_values(self.platform))
         if self.output_uri is not None:
             object.__setattr__(self, "output_uri", str(self.output_uri))
+        if self.organism is not None:
+            object.__setattr__(self, "organism", str(self.organism))
         if self.genome_size <= 0:
             raise ValueError("GENOME_SIZE must be > 0")
         if self.min_coverage < 0:
@@ -151,11 +157,89 @@ class Params:
             raise ValueError(f"missing parameter(s): {', '.join(missing)} (set in YAML or on the command line)")
         return cls(**values)
 
+    @classmethod
+    def overrides_from_yaml(cls, values: dict) -> dict:
+        """Turn YAML-style keys ({"MIN_COVERAGE": 5}) into overrides for from_sources."""
+        by_key = {cls.yaml_key(f.name): f.name for f in dataclasses.fields(cls)}
+        unknown = set(values) - set(by_key)
+        if unknown:
+            raise ValueError(f"unknown parameter(s): {', '.join(sorted(unknown))}")
+        return {by_key[k]: v for k, v in values.items()}
+
+    @property
+    def label(self) -> str:
+        """How this organism is named in logs and emails, e.g. "dog (taxon 9615)"."""
+        return f"{self.organism} (taxon {self.taxon_id})" if self.organism else f"taxon {self.taxon_id}"
+
+
+ORGANISMS_KEY = "ORGANISMS"
+
+
+def taxon_uri(root: str, taxon_id: int) -> str:
+    """Batch location for one organism under the shared OUTPUT_URI root."""
+    return f"{root.rstrip('/')}/taxon_id={taxon_id}/"
+
+
+def organism_params(config: dict, overrides: dict | None = None,
+                    only: Sequence[str] | None = None) -> list[Params]:
+    """One Params per organism: top-level config keys, then the organism's entry, then overrides.
+
+    In batch mode each organism writes to <OUTPUT_URI>/taxon_id=<id>/, so organisms
+    never share seen_runs.parquet. A config without an ORGANISMS section is a single
+    organism, and OUTPUT_URI is then used as given.
+
+    only: organism names to keep (default: all). Overriding taxon_id without naming
+    an organism queries that one taxon with the top-level defaults instead.
+    """
+    overrides = {k: v for k, v in (overrides or {}).items() if v is not None}
+    defaults = dict(config)
+    organisms = defaults.pop(ORGANISMS_KEY, None)
+
+    if organisms is None:
+        if only:
+            raise ValueError(f"no {ORGANISMS_KEY} section in the config, so --organism can't be used")
+        return [Params.from_sources(defaults, overrides)]
+    if not isinstance(organisms, dict) or not organisms:
+        raise ValueError(f"{ORGANISMS_KEY} must map organism names to their parameters")
+
+    def place(p: Params) -> Params:
+        return dataclasses.replace(p, output_uri=taxon_uri(p.output_uri, p.taxon_id)) if p.output_uri else p
+
+    if "taxon_id" in overrides and not only:
+        return [place(Params.from_sources(defaults, overrides))]
+
+    unknown = set(only or ()) - set(organisms)
+    if unknown:
+        raise ValueError(f"unknown organism(s): {', '.join(sorted(unknown))} "
+                         f"(the config has {', '.join(organisms)})")
+
+    result, taxa = [], {}
+    for name, entry in organisms.items():
+        if only and name not in only:
+            continue
+        entry = entry or {}
+        if not isinstance(entry, dict):
+            raise ValueError(f"{ORGANISMS_KEY}.{name} must be a mapping of parameters")
+        if blocked := {"OUTPUT_URI", "ORGANISM"} & set(entry):
+            raise ValueError(f"{ORGANISMS_KEY}.{name}: {', '.join(sorted(blocked))} can't be set per organism")
+        try:
+            p = Params.from_sources(defaults | entry | {"ORGANISM": name}, overrides)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"{ORGANISMS_KEY}.{name}: {e}") from None
+        if p.taxon_id in taxa:
+            raise ValueError(f"{ORGANISMS_KEY}: {taxa[p.taxon_id]} and {name} have the same TAXON_ID {p.taxon_id}")
+        taxa[p.taxon_id] = name
+        result.append(place(p))
+    return result
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="YAML parameter file (default: %(default)s)")
-    p.add_argument("--taxon-id", type=int, help="NCBI taxonomy ID")
+    p.add_argument("--organism", dest="organisms", nargs="+", metavar="NAME",
+                   help="only these organisms from the config's ORGANISMS section (default: all)")
+    p.add_argument("--taxon-id", type=int,
+                   help="NCBI taxonomy ID; without --organism, queries just this taxon using the top-level defaults")
     p.add_argument("--genome-size", type=float, help="genome size in bases, e.g. 2.7e9")
     p.add_argument("--min-coverage", type=float, help="minimum estimated coverage")
     p.add_argument("--release", help='OmicIDX release, "latest" or e.g. "v2026-11-02"')
@@ -170,7 +254,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_params(args: argparse.Namespace) -> Params:
+def load_params(args: argparse.Namespace) -> list[Params]:
     if args.config.exists():
         config = yaml.safe_load(args.config.read_text()) or {}
     elif args.config != DEFAULT_CONFIG:
@@ -178,7 +262,7 @@ def load_params(args: argparse.Namespace) -> Params:
     else:
         config = {}
     try:
-        return Params.from_sources(config, vars(args))
+        return organism_params(config, vars(args), only=args.organisms)
     except (ValueError, TypeError) as e:
         sys.exit(f"error: {e}")
 
@@ -241,36 +325,51 @@ def write_table(df: pl.DataFrame, path: Path) -> None:
             df.write_csv(path, separator="\t")
 
 
+def _show(v: object) -> str:
+    return ",".join(v) if isinstance(v, tuple) else NO_FILTER if v is None else str(v)
+
+
 def main() -> None:
     args = parse_args()
     if args.output and args.output.suffix.lower() not in set(OutputFormat):
         sys.exit(f"error: unsupported output format {args.output.suffix!r} (use {', '.join(OutputFormat)})")
-    params = load_params(args)
-    def show(v: object) -> str:
-        return ",".join(v) if isinstance(v, tuple) else NO_FILTER if v is None else str(v)
+    all_params = load_params(args)
+    for params in all_params:
+        print(f"{params.label}: " + ", ".join(f"{Params.yaml_key(k)}={_show(v)}"
+                                             for k, v in dataclasses.asdict(params).items() if k != "organism"),
+              file=sys.stderr)
 
-    print("parameters: " + ", ".join(f"{Params.yaml_key(k)}={show(v)}" for k, v in dataclasses.asdict(params).items()),
-          file=sys.stderr)
-
-    if params.output_uri:
+    if any(p.output_uri for p in all_params):
         if args.output:
             sys.exit("error: use either -o/--output (one-shot) or OUTPUT_URI/--output-uri (batch mode), not both")
         from batches import run_batch, store_from_uri  # imported lazily: needs boto3 only in batch mode
 
-        try:
-            result = run_batch(params, store_from_uri(params.output_uri))
-        except (SchemaError, SchemaErrors) as e:
-            sys.exit(f"error: data failed schema validation:\n{e}")
-        print(result.summary(), file=sys.stderr)
+        failed = []
+        for params in all_params:
+            try:
+                result = run_batch(params, store_from_uri(params.output_uri))
+            except (SchemaError, SchemaErrors) as e:
+                print(f"error: {params.label}: data failed schema validation:\n{e}", file=sys.stderr)
+                failed.append(params.label)
+                continue
+            print(f"{params.label}: {result.summary()}", file=sys.stderr)
+        if failed:
+            sys.exit(f"error: no batch written for {', '.join(failed)}")
         return
 
-    try:
-        runs = find_wgs_runs(params)
-    except (SchemaError, SchemaErrors) as e:
-        sys.exit(f"error: OmicIDX data failed schema validation:\n{e}")
-    print(f"{runs.height:,} runs across {runs[WgsRuns.study_accession].n_unique()} studies", file=sys.stderr)
-    if runs.is_empty():
-        print("warning: no runs matched; check TAXON_ID, LIBRARY_SOURCE and PLATFORM spelling", file=sys.stderr)
+    tables = []
+    for params in all_params:
+        try:
+            runs = find_wgs_runs(params)
+        except (SchemaError, SchemaErrors) as e:
+            sys.exit(f"error: {params.label}: OmicIDX data failed schema validation:\n{e}")
+        print(f"{params.label}: {runs.height:,} runs across {runs[WgsRuns.study_accession].n_unique()} studies",
+              file=sys.stderr)
+        if runs.is_empty():
+            print(f"warning: {params.label}: no runs matched; check TAXON_ID, LIBRARY_SOURCE and PLATFORM spelling",
+                  file=sys.stderr)
+        tables.append(runs)
+    runs = pl.concat(tables)  # each row carries its taxon_id
 
     if args.output:
         write_table(runs, args.output)

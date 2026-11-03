@@ -151,6 +151,8 @@ class BatchResult:
     new: int               # runs written in this batch
     previously_seen: int   # runs already output by earlier batches
     uri: str
+    taxon_id: int | None = None
+    organism: str | None = None
 
     def summary(self) -> str:
         if self.skipped:
@@ -174,7 +176,7 @@ def run_batch(
     if store.exists(manifest_key):
         done = json.loads(store.read_bytes(manifest_key))
         return BatchResult(batch_id, release.publish_date, True, done["matched"], done["new"],
-                           done["previously_seen"], batch_uri)
+                           done["previously_seen"], batch_uri, params.taxon_id, params.organism)
 
     params = dataclasses.replace(params, release=batch_id)  # pin the query to the dated release
     seen = load_seen(store)
@@ -198,7 +200,7 @@ def run_batch(
 
     # 3. manifest last: marks the batch complete
     result = BatchResult(batch_id, release.publish_date, False, matched.height, new.height,
-                         matched.height - new.height, batch_uri)
+                         matched.height - new.height, batch_uri, params.taxon_id, params.organism)
     manifest = {
         "batch_id": batch_id,
         "release": batch_id,

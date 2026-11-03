@@ -47,10 +47,12 @@ jobs:
         run: docker build --platform linux/arm64 --provenance=false -t "$ECR_REPOSITORY:$GITHUB_SHA" .
 
       - name: Smoke-test image
-        # The handler must import cleanly inside the image.
+        # The handler must import cleanly inside the image, and the bundled config.yaml must parse.
         run: >-
           docker run --rm --entrypoint python "$ECR_REPOSITORY:$GITHUB_SHA"
-          -c "import lambda_handler, awslambdaric, polars, pandera, boto3; print('ok', polars.__version__)"
+          -c "import lambda_handler, awslambdaric, polars, pandera, boto3;
+          ps = lambda_handler.build_params({'OUTPUT_URI': 's3://smoke/test'});
+          print('ok', polars.__version__, [p.label for p in ps])"
 
       - name: Configure AWS credentials
         if: env.DEPLOY == 'true'

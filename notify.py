@@ -1,4 +1,8 @@
-"""Email notification (via an SNS topic) when a new batch is written."""
+"""Email notification (via an SNS topic) when a new batch is written.
+
+One message per organism. Each carries taxon_id and organism message attributes, so
+an SNS subscription filter policy can route one organism's emails to someone else.
+"""
 
 import io
 import json
@@ -15,9 +19,16 @@ MAX_STUDIES = 10
 SNS_SUBJECT_LIMIT = 100
 
 
+def label(result: BatchResult) -> str:
+    if result.organism and result.taxon_id is not None:
+        return f"{result.organism} (taxon {result.taxon_id})"
+    return result.organism or (f"taxon {result.taxon_id}" if result.taxon_id is not None else "")
+
+
 def subject(result: BatchResult) -> str:
     runs = "run" if result.new == 1 else "runs"
-    text = f"omics-sra: {result.new:,} new WGS {runs} in batch {result.batch_id}"
+    who = f" {label(result)}" if label(result) else ""
+    text = f"omics-sra: {result.new:,} new{who} WGS {runs} in batch {result.batch_id}"
     return text[:SNS_SUBJECT_LIMIT]
 
 
@@ -34,10 +45,11 @@ def message(result: BatchResult, store: Store) -> str:
     runs = pl.read_parquet(io.BytesIO(store.read_bytes(batch_key(result.batch_id, "runs.parquet"))))
     params = manifest["parameters"]
     filters = ", ".join(f"{k}={'ALL' if v is None else ','.join(v) if isinstance(v, list) else v}"
-                        for k, v in params.items() if k != "OUTPUT_URI")
+                        for k, v in params.items() if k not in ("OUTPUT_URI", "ORGANISM"))
+    who = f" for {label(result)}" if label(result) else ""
 
     lines = [
-        f"A new batch of SRA WGS runs was written from OmicIDX release {result.batch_id} "
+        f"A new batch of SRA WGS runs{who} was written from OmicIDX release {result.batch_id} "
         f"(published {result.publish_date}).",
         "",
         f"  New runs in this batch:      {result.new:,}",
@@ -60,7 +72,7 @@ def message(result: BatchResult, store: Store) -> str:
         for acc, title, n, gb in studies.head(MAX_STUDIES).iter_rows():
             title = (title or "").strip()
             title = title if len(title) <= 70 else title[:67] + "..."
-            lines.append(f"  {n:>5,} runs  {gb:>8,.1f} Gb  {acc or '(no study)'}  {title}")
+            lines.append(f"  {n:>5,} runs  {gb:>10,.1f} Gb  {acc or '(no study)'}  {title}")
         if studies.height > MAX_STUDIES:
             lines.append(f"  ... and {studies.height - MAX_STUDIES:,} more")
 
@@ -87,5 +99,11 @@ def publish(topic_arn: str, result: BatchResult, store: Store, client=None) -> s
         import boto3
 
         client = boto3.client("sns")
-    resp = client.publish(TopicArn=topic_arn, Subject=subject(result), Message=message(result, store))
+    attributes = {}
+    if result.taxon_id is not None:
+        attributes["taxon_id"] = {"DataType": "Number", "StringValue": str(result.taxon_id)}
+    if result.organism:
+        attributes["organism"] = {"DataType": "String", "StringValue": result.organism}
+    resp = client.publish(TopicArn=topic_arn, Subject=subject(result), Message=message(result, store),
+                          MessageAttributes=attributes)
     return resp["MessageId"]
