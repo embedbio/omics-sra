@@ -2,6 +2,8 @@
 
 `wgs_runs.py` finds SRA whole genome sequencing (WGS) runs for one organism that have enough sequencing depth. It queries the [OmicIDX](https://omicidx.cancerdatasci.org) table `run_with_study.parquet` and writes out the runs whose estimated coverage meets a minimum you set.
 
+It can also run in [batch mode](#weekly-batches), where each run writes only the runs that no earlier batch has output. On AWS this runs [once a week](#running-weekly-on-aws) and writes each batch to S3.
+
 ## What it does
 
 1. **Reads** `https://omicidx.cancerdatasci.org/data/<RELEASE>/sradb/run_with_study.parquet`. Each row of this table is one SRA run, already joined to its experiment, sample and study. The file is scanned lazily, so polars downloads only the columns it needs instead of the whole table (about 46 million rows).
@@ -33,6 +35,7 @@ Parameters are read from `config.yaml`, and any of them can be overridden on the
 | `RELEASE` | `--release` | OmicIDX release: `latest` or a dated release such as `v2026-11-02` | `latest` |
 | `LIBRARY_SOURCE` | `--library-source` | Library source(s) to keep | `GENOMIC` |
 | `PLATFORM` | `--platform` | Sequencing platform(s) to keep | `ALL` |
+| `OUTPUT_URI` | `--output-uri` | [Batch mode](#weekly-batches): local directory or `s3://bucket/prefix` | `null` (off) |
 
 `LIBRARY_SOURCE` and `PLATFORM` take one value or a list, such as `PLATFORM: [ILLUMINA, PACBIO_SMRT]` in YAML or `--platform ILLUMINA PACBIO_SMRT` on the command line. `ALL` (or `null` in YAML) turns the filter off. Values are not case-sensitive.
 
@@ -103,13 +106,76 @@ Example counts from the 2026-11-02 release, for cat at ≥1x coverage:
 | `--platform ILLUMINA` | 1,455 | 60 |
 | `--library-source ALL` | 1,954 | 68 |
 
+## Weekly batches
+
+With `OUTPUT_URI` set, each run writes a **batch** containing only runs that weren't in any earlier batch:
+
+```bash
+uv run wgs_runs.py --output-uri ./batches               # local directory
+uv run wgs_runs.py --output-uri s3://my-bucket/wgs_runs  # S3 (uses your AWS credentials)
+```
+
+Each batch is named after the dated OmicIDX release it was built from. `latest` is resolved to that date first, so a batch can be reproduced exactly. The layout under `OUTPUT_URI` is:
+
+```
+seen_runs.parquet                  every run accession output so far, with the batch it first appeared in
+batches/v2026-11-03/runs.parquet   full table (columns as above) for the runs new in this batch
+batches/v2026-11-03/run_ids.txt    the same runs, one accession per line
+batches/v2026-11-03/manifest.json  parameters, release date and counts (matched, new, already seen)
+```
+
+- **The first batch contains every run that currently matches.** For cat with the defaults, the 2026-11-03 release gives 1,550.
+- **Later batches contain only new runs.** A week with no new runs still writes a batch, with an empty `runs.parquet` and `run_ids.txt`.
+- **Running again for the same release does nothing.** The batch is complete once its `manifest.json` exists. If a run fails partway, the next run rebuilds the same batch from scratch, so no runs are skipped or repeated.
+- **A run that is filtered out for a while and then comes back is not output again.** It is still listed in `seen_runs.parquet`.
+- **Changing the filters affects what counts as new.** For example, lowering `MIN_COVERAGE` makes runs that were excluded before appear in the next batch. To keep separate histories for different settings or organisms, give each its own `OUTPUT_URI`.
+- **Batch mode and `-o` can't be combined.**
+
+## Running weekly on AWS
+
+EventBridge Scheduler invokes a Lambda function (`omics-sra-wgs-batches`) every Monday at 13:00 Pacific. The function runs batch mode and writes to `s3://omics-sra-<account-id>/wgs_runs/taxon_id=9685/`. Its settings come from `config.yaml`, which is built into the image. The infrastructure is defined in two CloudFormation templates in [infra/](infra/):
+
+- **`infra/bootstrap.yaml`:** the ECR image repository, plus an IAM role that GitHub Actions on `main` can assume (through OIDC) to push images and update the function. It can do nothing else.
+- **`infra/app.yaml`:**
+  - the S3 bucket: private, versioned and encrypted, and kept if the stack is deleted
+  - the Lambda function: arm64, 1 GB memory, 15-minute timeout, at most one copy running at a time
+  - the weekly schedule
+  - a CloudWatch alarm that emails you (optionally) when the function fails
+
+**Deploying** (needs the AWS CLI, and the `gh` CLI for step 2):
+
+```bash
+infra/deploy.sh bootstrap                                     # 1. once
+gh variable set AWS_DEPLOY_ROLE_ARN --body <DeployRoleArn>    # 2. once, from the bootstrap output
+# 3. merge to main: the deploy workflow builds the image and pushes it to ECR
+infra/deploy.sh app "" you@example.com                        # 4. bucket, function, schedule, alarm
+```
+
+After that, every merge to `main` builds a new image (see [.github/workflows/deploy.yml](.github/workflows/deploy.yml)) and updates the function. Re-running `infra/deploy.sh app` keeps whatever image the function currently runs.
+
+**Running on demand, and checking results:**
+
+```bash
+aws lambda invoke --function-name omics-sra-wgs-batches --cli-read-timeout 900 out.json && cat out.json
+aws lambda invoke --function-name omics-sra-wgs-batches --cli-binary-format raw-in-base64-out \
+    --payload '{"MIN_COVERAGE": 10}' out.json                 # override any config.yaml key for one run
+aws s3 ls --recursive s3://omics-sra-<account-id>/wgs_runs/
+aws logs tail /aws/lambda/omics-sra-wgs-batches --since 7d
+```
+
+To change the schedule, redeploy with a different `ScheduleExpression`, e.g. `cron(0 6 ? * SUN *)`. You can also edit the `omics-sra-weekly` schedule in the EventBridge Scheduler console. To track a different organism, change `config.yaml` and the stack's `OutputPrefix` parameter.
+
+The image is built on `python:3.15.2-slim` with [awslambdaric](https://github.com/aws/aws-lambda-python-runtime-interface-client), because AWS doesn't offer a Python 3.15 Lambda base image yet.
+
 ## Tests
 
 ```bash
 uv run pytest
 ```
 
-The tests in `tests/test_schemas.py` check the pandera input and output schemas, and run `find_wgs_runs` against small local parquet files. They don't use the network.
+None of the tests use the network:
+- **`tests/test_schemas.py`:** checks the pandera input and output schemas, and runs `find_wgs_runs` against small local parquet files.
+- **`tests/test_batches.py`:** covers batch mode: first and later batches, reruns, empty weeks, recovery from a crash at each write, S3 storage (with [moto](https://github.com/getmoto/moto)) and the Lambda handler.
 
 ## Caveats
 

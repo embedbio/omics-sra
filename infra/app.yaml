@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  omics-sra weekly job: EventBridge Scheduler invokes a Lambda that writes a batch
+  of newly available SRA WGS runs (from OmicIDX) to an S3 bucket.
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: ECR image URI for the function, e.g. <account>.dkr.ecr.<region>.amazonaws.com/omics-sra:<git-sha>
+  FunctionName:
+    Type: String
+    Default: omics-sra-wgs-batches
+  OutputPrefix:
+    Type: String
+    Default: wgs_runs/taxon_id=9685
+    Description: Key prefix in the bucket for batches and seen_runs.parquet
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 13 ? * MON *)
+    Description: EventBridge Scheduler expression (default Mondays 13:00)
+  ScheduleTimezone:
+    Type: String
+    Default: America/Los_Angeles
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for failure alerts (you must confirm the SNS subscription email)
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub omics-sra-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 365
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt Bucket.Arn
+              - !Sub ${Bucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${FunctionName}
+      RetentionInDays: 90
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: logs-and-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub ${LogGroup.Arn}:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub ${Bucket.Arn}/${OutputPrefix}/*
+              - Effect: Allow
+                # Needed so HeadObject on a missing key returns 404 rather than 403.
+                Action: s3:ListBucket
+                Resource: !GetAtt Bucket.Arn
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Description: Weekly batch of new SRA WGS runs from OmicIDX
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      Architectures:
+        - arm64
+      MemorySize: 1024
+      Timeout: 900
+      ReservedConcurrentExecutions: 1  # never two runs at once (they share seen_runs.parquet)
+      Role: !GetAtt FunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+      Environment:
+        Variables:
+          OUTPUT_URI: !Sub s3://${Bucket}/${OutputPrefix}/
+
+  FunctionAsyncConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref Function
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 2
+      MaximumEventAgeInSeconds: 21600
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-function
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt Function.Arn
+                  - !Sub ${Function.Arn}:*
+
+  Schedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: omics-sra-weekly
+      Description: Weekly OmicIDX WGS-run batch
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: ENABLED
+      Target:
+        Arn: !GetAtt Function.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: "{}"
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 3600
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: omics-sra-alerts
+      Subscription: !If
+        - HasAlertEmail
+        - [{Protocol: email, Endpoint: !Ref AlertEmail}]
+        - !Ref AWS::NoValue
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: omics-sra-wgs-batches-errors
+      AlarmDescription: The weekly omics-sra batch Lambda failed
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Function
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+Outputs:
+  BucketName:
+    Value: !Ref Bucket
+  OutputUri:
+    Value: !Sub s3://${Bucket}/${OutputPrefix}/
+  FunctionName:
+    Value: !Ref Function
+  ScheduleName:
+    Value: !Ref Schedule
