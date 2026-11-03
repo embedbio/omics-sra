@@ -11,7 +11,9 @@ Examples:
 
 import argparse
 import dataclasses
+import json
 import sys
+import urllib.request
 from enum import StrEnum
 from pathlib import Path
 from typing import Self
@@ -23,6 +25,8 @@ from pandera.errors import SchemaError, SchemaErrors
 
 DEFAULT_CONFIG = Path(__file__).with_name("config.yaml")
 OMICIDX_URL = "https://omicidx.cancerdatasci.org/data/{release}/sradb/run_with_study.parquet"
+MANIFEST_URL = "https://omicidx.cancerdatasci.org/data/{release}/manifest.json"
+USER_AGENT = "omics-sra/0.1"  # the server rejects urllib's default User-Agent
 
 
 class LibraryStrategy(StrEnum):
@@ -107,6 +111,7 @@ class Params:
     release: str = "latest"
     library_source: tuple[str, ...] | None = ("GENOMIC",)
     platform: tuple[str, ...] | None = None
+    output_uri: str | None = None  # batch mode: local directory or s3://bucket/prefix
 
     def __post_init__(self) -> None:
         # Coerce types: PyYAML reads 2.7e9 as a string, not a float.
@@ -116,6 +121,8 @@ class Params:
         object.__setattr__(self, "release", str(self.release))
         object.__setattr__(self, "library_source", _filter_values(self.library_source))
         object.__setattr__(self, "platform", _filter_values(self.platform))
+        if self.output_uri is not None:
+            object.__setattr__(self, "output_uri", str(self.output_uri))
         if self.genome_size <= 0:
             raise ValueError("GENOME_SIZE must be > 0")
         if self.min_coverage < 0:
@@ -158,6 +165,8 @@ def parse_args() -> argparse.Namespace:
                    help=f'one or more platforms, e.g. ILLUMINA PACBIO_SMRT; "{NO_FILTER}" for no filter')
     p.add_argument("-o", "--output", type=Path,
                    help=f"write the full table ({', '.join(OutputFormat)}); otherwise print run IDs to stdout")
+    p.add_argument("--output-uri",
+                   help="batch mode: write only runs not in earlier batches to this local directory or s3://bucket/prefix")
     return p.parse_args()
 
 
@@ -177,6 +186,20 @@ def load_params(args: argparse.Namespace) -> Params:
 # ---------------------------------------------------------------------------
 # Query
 # ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Release:
+    name: str          # dated release, e.g. "v2026-11-03"
+    publish_date: str  # e.g. "2026-11-03"
+
+
+def resolve_release(release: str) -> Release:
+    """Resolve "latest" (or a dated release) to a dated release via its manifest.json."""
+    req = urllib.request.Request(MANIFEST_URL.format(release=release), headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        manifest = json.load(resp)
+    return Release(name=manifest["dated_path"].strip("/"), publish_date=manifest["publish_date"])
+
 
 def find_wgs_runs(params: Params) -> pl.DataFrame:
     # run_with_study already joins run -> experiment -> sample -> study.
@@ -228,6 +251,18 @@ def main() -> None:
 
     print("parameters: " + ", ".join(f"{Params.yaml_key(k)}={show(v)}" for k, v in dataclasses.asdict(params).items()),
           file=sys.stderr)
+
+    if params.output_uri:
+        if args.output:
+            sys.exit("error: use either -o/--output (one-shot) or OUTPUT_URI/--output-uri (batch mode), not both")
+        from batches import run_batch, store_from_uri  # imported lazily: needs boto3 only in batch mode
+
+        try:
+            result = run_batch(params, store_from_uri(params.output_uri))
+        except (SchemaError, SchemaErrors) as e:
+            sys.exit(f"error: data failed schema validation:\n{e}")
+        print(result.summary(), file=sys.stderr)
+        return
 
     try:
         runs = find_wgs_runs(params)

@@ -22,3 +22,8 @@ LIBRARY_SOURCE: GENOMIC
 # ALL (or null) = no filter.
 # Common values: ILLUMINA, PACBIO_SMRT, OXFORD_NANOPORE, BGISEQ, DNBSEQ, ION_TORRENT, LS454, ULTIMA, ELEMENT
 PLATFORM: ALL
+
+# Batch mode: a local directory or s3://bucket/prefix. Each run writes only runs
+# not output by an earlier batch. null = one-shot mode (print or -o).
+# On AWS the Lambda sets this from its OUTPUT_URI environment variable.
+OUTPUT_URI: null

@@ -1,0 +1,87 @@
+name: deploy
+
+# Builds the Lambda image on every push to main, pushes it to ECR, and points the
+# function at it. Needs the repository variable AWS_DEPLOY_ROLE_ARN (output of
+# infra/bootstrap.yaml); without it, the AWS steps are skipped.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]  # build and smoke-test only; AWS steps run on main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write  # OIDC token for assuming the AWS role
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-1
+  ECR_REPOSITORY: omics-sra
+  FUNCTION_NAME: omics-sra-wgs-batches
+  # AWS steps only run for main (push or manual run) once the role variable is set.
+  DEPLOY: ${{ vars.AWS_DEPLOY_ROLE_ARN != '' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04-arm  # native arm64 build for the arm64 Lambda
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv and Python 3.15
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.15"
+          enable-cache: true
+
+      - name: Run tests
+        run: |
+          uv sync --locked
+          uv run pytest -q
+
+      - name: Build image
+        run: docker build --platform linux/arm64 --provenance=false -t "$ECR_REPOSITORY:$GITHUB_SHA" .
+
+      - name: Smoke-test image
+        # The handler must import cleanly inside the image.
+        run: >-
+          docker run --rm --entrypoint python "$ECR_REPOSITORY:$GITHUB_SHA"
+          -c "import lambda_handler, awslambdaric, polars, pandera, boto3; print('ok', polars.__version__)"
+
+      - name: Configure AWS credentials
+        if: env.DEPLOY == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        if: env.DEPLOY == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image
+        if: env.DEPLOY == 'true'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          for tag in "$GITHUB_SHA" latest; do
+            docker tag "$ECR_REPOSITORY:$GITHUB_SHA" "$REGISTRY/$ECR_REPOSITORY:$tag"
+            docker push "$REGISTRY/$ECR_REPOSITORY:$tag"
+          done
+          echo "IMAGE_URI=$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" >> "$GITHUB_ENV"
+
+      - name: Update Lambda function
+        if: env.DEPLOY == 'true'
+        run: |
+          if aws lambda get-function --function-name "$FUNCTION_NAME" > /dev/null 2>&1; then
+            aws lambda update-function-code --function-name "$FUNCTION_NAME" --image-uri "$IMAGE_URI" > /dev/null
+            aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
+            echo "Updated $FUNCTION_NAME to $IMAGE_URI" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Function $FUNCTION_NAME does not exist yet; pushed $IMAGE_URI. Deploy infra/app.yaml with this ImageUri." >> "$GITHUB_STEP_SUMMARY"
+          fi
