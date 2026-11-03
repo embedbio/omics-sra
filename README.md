@@ -141,6 +141,7 @@ EventBridge Scheduler invokes a Lambda function (`omics-sra-wgs-batches`) every 
   - the Lambda function: arm64, 1 GB memory, 15-minute timeout, at most one copy running at a time
   - the weekly schedule
   - a CloudWatch alarm that emails you (optionally) when the function fails
+  - an SNS topic, `omics-sra-batches`, that emails you each time a new batch is written
 
 **Deploying** (needs the AWS CLI, and the `gh` CLI for step 2):
 
@@ -163,6 +164,13 @@ aws s3 ls --recursive s3://omics-sra-<account-id>/wgs_runs/
 aws logs tail /aws/lambda/omics-sra-wgs-batches --since 7d
 ```
 
+**Email notifications.** Each new batch sends an email with the subject `omics-sra: <N> new WGS runs in batch <release>`. It contains the counts, the filters used, the top studies in the batch (runs and Gb), the first 20 run IDs, and links to the files and the S3 console.
+- Weeks with zero new runs still send an email, so you know the job ran.
+- A rerun for a release that was already processed sends nothing.
+- By default, notices go to the same address as the failure alerts. To use a different one, pass `BatchEmail` when you deploy.
+- AWS sends a confirmation email for each subscription, and nothing is delivered until you click its link.
+- You can add more subscribers to the `omics-sra-batches` topic in the SNS console.
+
 To change the schedule, redeploy with a different `ScheduleExpression`, e.g. `cron(0 6 ? * SUN *)`. You can also edit the `omics-sra-weekly` schedule in the EventBridge Scheduler console. To track a different organism, change `config.yaml` and the stack's `OutputPrefix` parameter.
 
 The image is built on `python:3.15.2-slim` with [awslambdaric](https://github.com/aws/aws-lambda-python-runtime-interface-client), because AWS doesn't offer a Python 3.15 Lambda base image yet.
@@ -175,7 +183,7 @@ uv run pytest
 
 None of the tests use the network:
 - **`tests/test_schemas.py`:** checks the pandera input and output schemas, and runs `find_wgs_runs` against small local parquet files.
-- **`tests/test_batches.py`:** covers batch mode: first and later batches, reruns, empty weeks, recovery from a crash at each write, S3 storage (with [moto](https://github.com/getmoto/moto)) and the Lambda handler.
+- **`tests/test_batches.py`:** covers batch mode: first and later batches, reruns, empty weeks, recovery from a crash at each write, S3 storage (with [moto](https://github.com/getmoto/moto)), the Lambda handler and the batch emails (SNS).
 
 ## Caveats
 

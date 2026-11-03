@@ -25,9 +25,17 @@ Parameters:
     Type: String
     Default: ""
     Description: Optional email for failure alerts (you must confirm the SNS subscription email)
+  BatchEmail:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional email notified each time a new batch is written. Leave empty to use
+      AlertEmail. You must confirm the SNS subscription email.
 
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  HasBatchEmail: !Not [!Equals [!Ref BatchEmail, ""]]
+  NotifyBatches: !Or [!Condition HasBatchEmail, !Condition HasAlertEmail]
 
 Resources:
   Bucket:
@@ -110,6 +118,9 @@ Resources:
                 # Needed so HeadObject on a missing key returns 404 rather than 403.
                 Action: s3:ListBucket
                 Resource: !GetAtt Bucket.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref BatchTopic
 
   Function:
     Type: AWS::Lambda::Function
@@ -130,6 +141,7 @@ Resources:
       Environment:
         Variables:
           OUTPUT_URI: !Sub s3://${Bucket}/${OutputPrefix}/
+          NOTIFY_TOPIC_ARN: !Ref BatchTopic
 
   FunctionAsyncConfig:
     Type: AWS::Lambda::EventInvokeConfig
@@ -190,6 +202,16 @@ Resources:
         - [{Protocol: email, Endpoint: !Ref AlertEmail}]
         - !Ref AWS::NoValue
 
+  BatchTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: omics-sra-batches
+      DisplayName: omics-sra
+      Subscription: !If
+        - NotifyBatches
+        - [{Protocol: email, Endpoint: !If [HasBatchEmail, !Ref BatchEmail, !Ref AlertEmail]}]
+        - !Ref AWS::NoValue
+
   ErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -218,3 +240,6 @@ Outputs:
     Value: !Ref Function
   ScheduleName:
     Value: !Ref Schedule
+  BatchTopicArn:
+    Description: SNS topic notified for each new batch (add more subscribers here)
+    Value: !Ref BatchTopic

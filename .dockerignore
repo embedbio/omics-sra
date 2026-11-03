@@ -3,5 +3,6 @@
 !uv.lock
 !wgs_runs.py
 !batches.py
+!notify.py
 !lambda_handler.py
 !config.yaml
