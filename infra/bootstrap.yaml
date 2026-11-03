@@ -8,6 +8,12 @@ Parameters:
     Type: String
     Default: embedbio/omics-sra
     Description: owner/name of the GitHub repository allowed to deploy
+  GitHubRepoImmutable:
+    Type: String
+    Default: embedbio@344526602/omics-sra@1444634197
+    Description: >-
+      owner@ownerId/name@repoId, used when the repository's OIDC "sub" claim uses
+      immutable IDs. See: gh api repos/OWNER/REPO/actions/oidc/customization/sub
   FunctionName:
     Type: String
     Default: omics-sra-wgs-batches
@@ -71,7 +77,10 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:ref:refs/heads/main
+                # main branch only; either sub format (a list here means "any of").
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubRepo}:ref:refs/heads/main
+                  - !Sub repo:${GitHubRepoImmutable}:ref:refs/heads/main
       Policies:
         - PolicyName: push-image-and-update-function
           PolicyDocument:
