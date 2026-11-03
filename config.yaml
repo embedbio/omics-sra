@@ -1,0 +1,24 @@
+# Parameters for wgs_runs.py. Any value here can be overridden on the command line.
+
+# NCBI taxonomy ID of the organism (9685 = Felis catus)
+TAXON_ID: 9685
+
+# Approximate genome size in bases, used to estimate coverage (total_bases / GENOME_SIZE)
+GENOME_SIZE: 2.7e9
+
+# Keep only runs with at least this estimated coverage
+MIN_COVERAGE: 1.0
+
+# OmicIDX release: "latest" or a pinned version such as "v2026-11-02"
+RELEASE: latest
+
+# Library source(s) to keep: one value or a list. ALL (or null) = no filter.
+# GENOMIC excludes metagenomes where the organism is only the host.
+# Values: GENOMIC, GENOMIC SINGLE CELL, METAGENOMIC, METATRANSCRIPTOMIC,
+#         TRANSCRIPTOMIC, TRANSCRIPTOMIC SINGLE CELL, VIRAL RNA, SYNTHETIC, OTHER
+LIBRARY_SOURCE: GENOMIC
+
+# Sequencing platform(s) to keep: one value or a list, e.g. ILLUMINA or [ILLUMINA, PACBIO_SMRT].
+# ALL (or null) = no filter.
+# Common values: ILLUMINA, PACBIO_SMRT, OXFORD_NANOPORE, BGISEQ, DNBSEQ, ION_TORRENT, LS454, ULTIMA, ELEMENT
+PLATFORM: ALL
