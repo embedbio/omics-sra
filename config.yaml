@@ -39,6 +39,12 @@ ORGANISMS:
   dog:
     TAXON_ID: 9615      # Canis lupus familiaris
     GENOME_SIZE: 2.4e9
+  wolf:
+    TAXON_ID: 9612      # Canis lupus
+    GENOME_SIZE: 2.4e9
+  cow:
+    TAXON_ID: 9913      # Bos taurus
+    GENOME_SIZE: 2.7e9
   # Example with per-organism overrides:
   # cattle:
   #   TAXON_ID: 9913    # Bos taurus

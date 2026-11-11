@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import boto3
 import polars as pl
 import pytest
+import yaml
 from moto import mock_aws
 
 import batches as b
@@ -208,6 +209,19 @@ def test_batches_on_s3(s3_store):
 # Lambda handler
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def handler_config(monkeypatch, tmp_path):
+    """The bundled config.yaml's defaults with only cat and dog, so editing its organism list doesn't break these tests."""
+    config = yaml.safe_load(lambda_handler.CONFIG.read_text())
+    config["ORGANISMS"] = {
+        "cat": {"TAXON_ID": 9685, "GENOME_SIZE": 2.7e9},
+        "dog": {"TAXON_ID": 9615, "GENOME_SIZE": 2.4e9},
+    }
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config))
+    monkeypatch.setattr(lambda_handler, "CONFIG", path)
+
+
 def handler_batch(release_name, *run_ids):
     """Stand-in for run_batch in the handler: same run IDs for every organism."""
     return lambda params, store: run_batch(params, store, query=fake_query(*run_ids),
@@ -219,7 +233,7 @@ def test_handler_params_one_per_organism(monkeypatch, tmp_path):
     monkeypatch.setenv("OUTPUT_ROOT", str(tmp_path / "root"))
     ps = lambda_handler.build_params({"MIN_COVERAGE": 10})
     by_name = {p.organism: p for p in ps}
-    assert set(by_name) == {"cat", "dog"}  # from the bundled config.yaml
+    assert set(by_name) == {"cat", "dog"}  # from the handler_config fixture
     assert by_name["cat"].taxon_id == 9685 and by_name["cat"].genome_size == 2.7e9
     assert by_name["dog"].taxon_id == 9615 and by_name["dog"].genome_size == 2.4e9
     assert all(p.min_coverage == 10.0 for p in ps)  # event overrides apply to every organism
